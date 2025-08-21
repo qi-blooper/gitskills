@@ -26,29 +26,65 @@ def _extract_pos_grids(pos_struct) -> Tuple[np.ndarray, np.ndarray]:
     R = np.asarray(R)
     Z = np.asarray(Z)
 
-    # User's code drops the first radial sample
-    if R.ndim == 2:
-        R = R[1:, :]
-        if R.shape[1] == 1:
-            R = R[:, 0]
+    # Do NOT drop any element here. The MAT file you provided already has R shaped like (50, 1)
+    # after removing r=0 elsewhere. We just flatten to 1D vectors.
+    if R.ndim == 2 and R.shape[1] == 1:
+        R_vec = R[:, 0]
     else:
-        R = R[1:]
-
-    # Flatten to 1D vectors
-    R_vec = np.ravel(R)
+        R_vec = np.ravel(R)
     Z_vec = np.ravel(Z)
     return R_vec, Z_vec
 
 
-def _ensure_2d_z_r(pressure_complex: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Squeeze to 2D (Z, R) arrays for real and imaginary parts.
+def _prepare_pressure_ZR(pressure_complex: np.ndarray, z_len: int, r_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Coerce complex pressure to 2D (Z, R) by possibly dropping r=0 and/or transposing.
 
-    Input is already sliced to drop r=0 column on the last axis. The last two dims are (Z, R).
+    Logic tries the following in order:
+      - If shape == (Z, R): OK
+      - If shape == (R, Z): transpose
+      - If shape == (Z, R+1): drop first column [:, 1:]
+      - If shape == (R+1, Z): drop first row [1:, :] then transpose
+      - Otherwise, attempt to adapt based on last dimension matching R or R+1.
     """
 
     pc = np.squeeze(pressure_complex)
-    if pc.ndim != 2:
-        raise ValueError(f"Expected 2D (Z, R) after squeeze, got shape {pc.shape}")
+    if pc.ndim < 2:
+        raise ValueError(f"Pressure must be at least 2D after squeeze; got {pc.shape}")
+
+    # Keep only the last two dimensions, assuming any leading dims are singleton/meta
+    if pc.ndim > 2:
+        pc = pc.reshape(pc.shape[-2], pc.shape[-1])
+
+    shape = pc.shape
+    # Direct matches
+    if shape == (z_len, r_len):
+        pass
+    elif shape == (r_len, z_len):
+        pc = pc.T
+    elif shape == (z_len, r_len + 1):
+        pc = pc[:, 1:]
+    elif shape == (r_len + 1, z_len):
+        pc = pc[1:, :].T
+    else:
+        # Heuristics on last dimension
+        if shape[-1] == r_len + 1 and shape[0] == z_len:
+            pc = pc[:, 1:]
+        elif shape[-1] == r_len and shape[0] == z_len:
+            pass
+        elif shape[-1] == z_len and shape[0] == r_len + 1:
+            pc = pc[1:, :].T
+        elif shape[-1] == z_len and shape[0] == r_len:
+            pc = pc.T
+        else:
+            raise ValueError(
+                f"Cannot align pressure shape {shape} to (Z,R)=({z_len},{r_len}). "
+                "Please inspect MAT dimensions."
+            )
+
+    if pc.shape != (z_len, r_len):
+        raise ValueError(
+            f"Aligned pressure shape {pc.shape} still does not equal (Z,R)=({z_len},{r_len})."
+        )
     return np.real(pc), np.imag(pc)
 
 
@@ -74,11 +110,6 @@ def main():
     # Pressure data: complex array with last dim as frequency.
     pressure = mat['pressure']
     pressure = pressure.astype(np.complex64)
-    # Drop the first r=0 column along the last axis (last two dims are Z, R)
-    pressure = pressure[..., 1:]
-
-    # Single-frequency data: produce 2D (Z, R-1)
-    pr2d, pi2d = _ensure_2d_z_r(pressure)
 
     # Wavenumber from freqVec if available, else raise to force explicit value
     if 'freqVec' in mat:
@@ -92,22 +123,16 @@ def main():
     else:
         raise ValueError("MAT file has single-frequency pressure but no freqVec; please add freqVec or modify script to pass k explicitly.")
 
-    # Extract grids
+    # Extract grids (no further dropping here)
     pos = mat['Pos']
     R_vec, Z_vec = _extract_pos_grids(pos)
 
     # Meshgrid (Z first, R second) as in the user's code
     ZZ, RR = np.meshgrid(Z_vec, R_vec, indexing="ij")
 
-    # Ensure shapes are consistent with meshgrid
+    # Coerce pressure to (Z, R) and align with RR/ZZ shapes
     z_len, r_len = ZZ.shape[0], RR.shape[1]
-    if pr2d.shape == (z_len, r_len):
-        pass
-    elif pr2d.shape == (r_len, z_len):
-        pr2d = pr2d.T
-        pi2d = pi2d.T
-    else:
-        raise ValueError(f"Pressure shape {pr2d.shape} does not match (Z,R)=({z_len},{r_len})")
+    pr2d, pi2d = _prepare_pressure_ZR(pressure, z_len=z_len, r_len=r_len)
 
     # Flatten to (N, 1)
     r_coords = RR.reshape(-1, 1).astype(np.float32)
