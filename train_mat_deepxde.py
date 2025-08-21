@@ -40,33 +40,21 @@ def _extract_pos_grids(pos_struct) -> Tuple[np.ndarray, np.ndarray]:
     return R_vec, Z_vec
 
 
-def _select_frequency_and_reshape(pressure_real: np.ndarray, pressure_imag: np.ndarray, freq_idx_in_sliced: int,
-                                  z_len: int, r_len: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Select one frequency slice from pressure arrays and reshape to (z_len, r_len).
+def _ensure_2d_z_r(pressure_complex: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Squeeze to 2D (Z, R) arrays for real and imaginary parts.
 
-    pressure_* are arrays after slicing with [..., 1:]. This function further selects one
-    frequency by index and ensures shape matches the meshgrid (len(Z), len(R)).
+    Input is already sliced to drop r=0 column on the last axis. The last two dims are (Z, R).
     """
 
-    pr = np.squeeze(pressure_real[..., freq_idx_in_sliced])
-    pi = np.squeeze(pressure_imag[..., freq_idx_in_sliced])
-
-    # Try to coerce to (z_len, r_len)
-    if pr.shape == (z_len, r_len):
-        pass
-    elif pr.shape == (r_len, z_len):
-        pr = pr.T
-        pi = pi.T
-    else:
-        raise ValueError(f"Unexpected pressure slice shape {pr.shape}, expected {(z_len, r_len)} or {(r_len, z_len)}")
-
-    return pr, pi
+    pc = np.squeeze(pressure_complex)
+    if pc.ndim != 2:
+        raise ValueError(f"Expected 2D (Z, R) after squeeze, got shape {pc.shape}")
+    return np.real(pc), np.imag(pc)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train DeepXDE PINN from .mat pressure data")
     parser.add_argument("--mat_path", type=str, required=True, help="Path to .mat file")
-    parser.add_argument("--freq_index_after_drop", type=int, default=0, help="Frequency index after dropping the first (corresponds to ...[..., 1:])")
     parser.add_argument("--c", type=float, default=1500.0, help="Sound speed (m/s)")
     parser.add_argument("--hidden", type=int, nargs="+", default=[256, 256, 256], help="Hidden layer sizes")
     parser.add_argument("--num_frequencies", type=int, default=64, help="Number of Fourier features")
@@ -86,19 +74,23 @@ def main():
     # Pressure data: complex array with last dim as frequency.
     pressure = mat['pressure']
     pressure = pressure.astype(np.complex64)
+    # Drop the first r=0 column along the last axis (last two dims are Z, R)
+    pressure = pressure[..., 1:]
 
-    real_pressure = np.real(pressure)[..., 1:]
-    imag_pressure = np.imag(pressure)[..., 1:]
+    # Single-frequency data: produce 2D (Z, R-1)
+    pr2d, pi2d = _ensure_2d_z_r(pressure)
 
-    # Frequency vector and wavenumber k
-    freq_vec = np.asarray(mat['freqVec']).astype(np.float64)
-    # Convert to 1D vector
-    freq_vec = np.ravel(freq_vec)
-    if freq_vec.size < 2:
-        raise ValueError("Expected at least 2 frequency points to drop the first; found < 2.")
-    freq_selected = freq_vec[1 + args.freq_index_after_drop]
-    omega = 2.0 * np.pi * float(freq_selected)
-    k_value = omega / float(args.c)
+    # Wavenumber from freqVec if available, else raise to force explicit value
+    if 'freqVec' in mat:
+        freq_vec = np.asarray(mat['freqVec']).astype(np.float64)
+        freq_vec = np.ravel(freq_vec)
+        if freq_vec.size == 0:
+            raise ValueError("freqVec is empty; cannot compute k. Provide freqVec in MAT file.")
+        freq_selected = float(freq_vec[0])
+        omega = 2.0 * np.pi * freq_selected
+        k_value = omega / float(args.c)
+    else:
+        raise ValueError("MAT file has single-frequency pressure but no freqVec; please add freqVec or modify script to pass k explicitly.")
 
     # Extract grids
     pos = mat['Pos']
@@ -107,10 +99,15 @@ def main():
     # Meshgrid (Z first, R second) as in the user's code
     ZZ, RR = np.meshgrid(Z_vec, R_vec, indexing="ij")
 
-    # Select one frequency slice and ensure it matches (len(Z), len(R))
-    pr2d, pi2d = _select_frequency_and_reshape(
-        real_pressure, imag_pressure, args.freq_index_after_drop, ZZ.shape[0], RR.shape[1]
-    )
+    # Ensure shapes are consistent with meshgrid
+    z_len, r_len = ZZ.shape[0], RR.shape[1]
+    if pr2d.shape == (z_len, r_len):
+        pass
+    elif pr2d.shape == (r_len, z_len):
+        pr2d = pr2d.T
+        pi2d = pi2d.T
+    else:
+        raise ValueError(f"Pressure shape {pr2d.shape} does not match (Z,R)=({z_len},{r_len})")
 
     # Flatten to (N, 1)
     r_coords = RR.reshape(-1, 1).astype(np.float32)
